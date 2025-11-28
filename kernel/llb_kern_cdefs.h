@@ -983,15 +983,33 @@ dp_rewire_port(void *tbl, struct xfi *xf)
 }
 
 static int __always_inline
+dp_is_ppv2_ipv6(struct xfi *xf)
+{
+  /* For NAT64: xlate_proto=1 and current packet is IPv4 means original was IPv6 */
+  if (xf->nm.xlate_proto && xf->l2m.dl_type == bpf_htons(ETH_P_IP)) {
+    return 1;  /* NAT64: IPv6 client → IPv4 backend, PPv2 should be IPv6 */
+  }
+
+  /* For NAT46: xlate_proto=1 and current packet is IPv6 means original was IPv4 */
+  if (xf->nm.xlate_proto && xf->l2m.dl_type == bpf_htons(ETH_P_IPV6)) {
+    return 0;  /* NAT46: IPv4 client → IPv6 backend, PPv2 should be IPv4 */
+  }
+
+  /* For NAT66 or no protocol translation: check if addresses are IPv6 */
+  return (xf->l34m.saddr[1] | xf->l34m.saddr[2] | xf->l34m.saddr[3] |
+          xf->l34m.daddr[1] | xf->l34m.daddr[2] | xf->l34m.daddr[3]) != 0;
+}
+
+static int __always_inline
 dp_populate_ppv2(void *md, struct xfi *xf, void *start, __be32 *csum)
 {
   struct proxy_hdr_v2 *ppv2h;
-  struct proxy_ipv4_hdr *piph;
   __u8 sig[12] = { 0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D,
                    0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A };
   void *dend = DP_TC_PTR(DP_PDATA_END(md));
+  int is_ipv6 = dp_is_ppv2_ipv6(xf);
 
-  ppv2h = start; 
+  ppv2h = start;
   if (ppv2h + 1 > dend) {
     LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
     return -1;
@@ -999,21 +1017,49 @@ dp_populate_ppv2(void *md, struct xfi *xf, void *start, __be32 *csum)
 
   memcpy(ppv2h->sig, sig, 12);
   ppv2h->ver_cmd = 0x21;
-  ppv2h->family = 0x11;
-  ppv2h->len = bpf_htons(sizeof(struct proxy_ipv4_hdr));
 
-  piph = (void *)(ppv2h + 1);
-  if (piph + 1 > dend) {
-    LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
-    return -1;
+  if (is_ipv6) {
+    /* IPv6 + TCP/UDP */
+    struct proxy_ipv6_hdr *pip6h;
+    __u8 proto_family = (xf->l34m.nw_proto == IPPROTO_TCP) ? 0x21 : 0x22;
+
+    ppv2h->family = proto_family;  /* 0x21 = IPv6+TCP, 0x22 = IPv6+UDP */
+    ppv2h->len = bpf_htons(sizeof(struct proxy_ipv6_hdr));
+
+    pip6h = (void *)(ppv2h + 1);
+    if (pip6h + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+
+    /* Copy IPv6 addresses (16 bytes each) */
+    memcpy(pip6h->src_addr, xf->l34m.saddr, 16);
+    memcpy(pip6h->dst_addr, xf->l34m.daddr, 16);
+    pip6h->src_port = xf->l34m.source;
+    pip6h->dst_port = xf->l34m.dest;
+
+    *csum = bpf_csum_diff((__be32 *)ppv2h, sizeof(*ppv2h) + sizeof(*pip6h), 0, 0, *csum);
+  } else {
+    /* IPv4 + TCP/UDP */
+    struct proxy_ipv4_hdr *piph;
+    __u8 proto_family = (xf->l34m.nw_proto == IPPROTO_TCP) ? 0x11 : 0x12;
+
+    ppv2h->family = proto_family;  /* 0x11 = IPv4+TCP, 0x12 = IPv4+UDP */
+    ppv2h->len = bpf_htons(sizeof(struct proxy_ipv4_hdr));
+
+    piph = (void *)(ppv2h + 1);
+    if (piph + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+
+    piph->src_addr = xf->l34m.saddr[0];
+    piph->dst_addr = xf->l34m.daddr[0];
+    piph->src_port = xf->l34m.source;
+    piph->dst_port = xf->l34m.dest;
+
+    *csum = bpf_csum_diff((__be32 *)ppv2h, sizeof(*ppv2h) + sizeof(*piph), 0, 0, *csum);
   }
-
-  piph->src_addr = xf->l34m.saddr[0];
-  piph->dst_addr = xf->l34m.daddr[0];
-  piph->src_port = xf->l34m.source;
-  piph->dst_port = xf->l34m.dest;
-
-  *csum = bpf_csum_diff((__be32 *)ppv2h, sizeof(*ppv2h) + sizeof(*piph), 0, 0, *csum);
 
   return 0;
 }
@@ -1026,8 +1072,17 @@ dp_fixup_ppv2(void *md, struct xfi *xf)
   __be32 oval = 0;
   __u32 nval = 0;
   __u32 csum = 0;
+  __u16 ppv2_addr_len;
+  int is_ipv6;
 
-  if (xf->l2m.dl_type != bpf_htons(ETH_P_IP) || xf->l34m.nw_proto != IPPROTO_TCP) {
+  /* Only TCP needs sequence number fixup */
+  if (xf->l34m.nw_proto != IPPROTO_TCP) {
+    return 0;
+  }
+
+  /* Support both IPv4 and IPv6 packets */
+  if (xf->l2m.dl_type != bpf_htons(ETH_P_IP) &&
+      xf->l2m.dl_type != bpf_htons(ETH_P_IPV6)) {
     return 0;
   }
 
@@ -1038,14 +1093,18 @@ dp_fixup_ppv2(void *md, struct xfi *xf)
     return -1;
   }
 
+  /* Determine PPv2 address header size based on original address family */
+  is_ipv6 = dp_is_ppv2_ipv6(xf);
+  ppv2_addr_len = is_ipv6 ? sizeof(struct proxy_ipv6_hdr) : sizeof(struct proxy_ipv4_hdr);
+
   if (xf->pm.oppv2) {
     oval = tcp->seq;
-    nval = bpf_ntohl(tcp->seq) + sizeof(struct proxy_hdr_v2) + sizeof(struct proxy_ipv4_hdr);
+    nval = bpf_ntohl(tcp->seq) + sizeof(struct proxy_hdr_v2) + ppv2_addr_len;
     tcp->seq = bpf_htonl(nval);
     nval = tcp->seq;
   } else if (xf->pm.ippv2) {
     oval = tcp->ack_seq;
-    nval = bpf_ntohl(tcp->ack_seq) - (sizeof(struct proxy_hdr_v2) + sizeof(struct proxy_ipv4_hdr));
+    nval = bpf_ntohl(tcp->ack_seq) - (sizeof(struct proxy_hdr_v2) + ppv2_addr_len);
     tcp->ack_seq = bpf_htonl(nval);
     nval = tcp->ack_seq;
   }
@@ -1058,24 +1117,37 @@ dp_fixup_ppv2(void *md, struct xfi *xf)
 
 static int __always_inline
 dp_ins_ppv2(void *md, struct xfi *xf)
-{ 
+{
   struct proxy_hdr_v2 *ppv2h;
   struct iphdr *iph;
+  struct ipv6hdr *ip6h;
   struct tcphdr *tcp;
   struct tcphdr *ntcp;
+  struct udphdr *udp;
+  struct udphdr *nudp;
   void *dend;
   __u16 doff;
   __u32 olp;
   __u32 nlp;
   __u64 flags;
   __u32 csum = 0;
+  int is_ipv6 = dp_is_ppv2_ipv6(xf);
+  int is_tcp = (xf->l34m.nw_proto == IPPROTO_TCP);
+  int is_udp = (xf->l34m.nw_proto == IPPROTO_UDP);
 
   int len = sizeof(struct proxy_hdr_v2);
 
-  if (xf->l2m.dl_type == bpf_htons(ETH_P_IP) && xf->l34m.nw_proto == IPPROTO_TCP) {
-    len += sizeof(struct proxy_ipv4_hdr);
-  } else {
-    // FIXME - not supported now
+  /* Calculate PPv2 header size based on address family */
+  len += is_ipv6 ? sizeof(struct proxy_ipv6_hdr) : sizeof(struct proxy_ipv4_hdr);
+
+  /* Support both TCP and UDP */
+  if (!is_tcp && !is_udp) {
+    return 0;
+  }
+
+  /* Support both IPv4 and IPv6 */
+  if (xf->l2m.dl_type != bpf_htons(ETH_P_IP) &&
+      xf->l2m.dl_type != bpf_htons(ETH_P_IPV6)) {
     return 0;
   }
 
@@ -1089,17 +1161,28 @@ dp_ins_ppv2(void *md, struct xfi *xf)
     return -1;
   }
 
-  if (xf->l34m.nw_proto == IPPROTO_TCP)  {
-    dend = DP_TC_PTR(DP_PDATA_END(md));
+  /* Update IP header length for both IPv4 and IPv6 */
+  dend = DP_TC_PTR(DP_PDATA_END(md));
+
+  if (xf->l2m.dl_type == bpf_htons(ETH_P_IP)) {
     iph = DP_ADD_PTR(DP_PDATA(md), xf->pm.l3_off);
     if (iph + 1 > dend) {
       LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
       return -1;
     }
-
     iph->tot_len = bpf_htons(xf->pm.l3_len + len);
     dp_ipv4_new_csum((void *)iph);
+  } else if (xf->l2m.dl_type == bpf_htons(ETH_P_IPV6)) {
+    ip6h = DP_ADD_PTR(DP_PDATA(md), xf->pm.l3_off);
+    if (ip6h + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+    ip6h->payload_len = bpf_htons(bpf_ntohs(ip6h->payload_len) + len);
+  }
 
+  /* Handle TCP protocol */
+  if (is_tcp) {
     dend = DP_TC_PTR(DP_PDATA_END(md));
     tcp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off + len);
     if (tcp + 1 > dend) {
@@ -1200,12 +1283,6 @@ dp_ins_ppv2(void *md, struct xfi *xf)
     }
 
     dend = DP_TC_PTR(DP_PDATA_END(md));
-    iph = DP_ADD_PTR(DP_PDATA(md), xf->pm.l3_off);
-    if (iph + 1 > dend) {
-      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
-      return -1;
-    }
-
     tcp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
     if (tcp + 1 > dend) {
       LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
@@ -1214,6 +1291,54 @@ dp_ins_ppv2(void *md, struct xfi *xf)
 
     tcp->check = csum_fold_helper_diff((__u32)csum);
   }
+  /* Handle UDP protocol */
+  else if (is_udp) {
+    dend = DP_TC_PTR(DP_PDATA_END(md));
+    udp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off + len);
+    if (udp + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+
+    /* Update UDP length */
+    __u16 old_len = udp->len;
+    __u16 new_len = bpf_htons(bpf_ntohs(old_len) + len);
+
+    nudp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
+    if (nudp + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+
+    __builtin_memmove(nudp, udp, sizeof(*udp));
+    nudp->len = new_len;
+
+    /* Insert PPv2 header right after UDP header */
+    ppv2h = (void *)(nudp + 1);
+    if ((void *)(ppv2h + 1) > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+
+    /* Checksum changes for UDP */
+    olp = (__u32)bpf_htons(xf->pm.l3_plen);
+    nlp = (__u32)bpf_htons(olp + len);
+    csum = bpf_csum_diff((__be32 *)&nlp, 4, (__be32 *)&olp, 4, udp->check);
+
+    dp_populate_ppv2(md, xf, ppv2h, &csum);
+
+    dend = DP_TC_PTR(DP_PDATA_END(md));
+    nudp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
+    if (nudp + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+
+    if (nudp->check != 0) {
+      nudp->check = csum_fold_helper_diff((__u32)csum);
+    }
+  }
+
   return 0;
 }
 
