@@ -247,14 +247,14 @@ dp_do_rt_tun_nh(void *ctx, struct xfi *xf, __u32 tun_type,
 static int __always_inline
 dp_do_nh_lkup(void *ctx, struct xfi *xf, void *fa_)
 {
-  struct dp_nh_key key;
+  __u32 key;
   struct dp_nh_tact *nha;
   int rnh = 0;
 #ifdef HAVE_DP_FC
   struct dp_fc_tacts *fa = fa_;
 #endif
 
-  key.nh_num = (__u32)xf->pm.nh_num;
+  key = (__u32)xf->pm.nh_num;
 
   BPF_TRACE_PRINTK("[NHFW] lkup %d", key.nh_num);
   xf->pm.table_id = LL_DP_NH_MAP;
@@ -283,7 +283,7 @@ dp_do_nh_lkup(void *ctx, struct xfi *xf, void *fa_)
     rnh = dp_do_rt_l2_nh(ctx, xf, &nha->rt_l2nh);
     /* Check if need to do recursive next-hop lookup */
     if (rnh != 0) {
-      key.nh_num = (__u32)rnh;
+      key = (__u32)rnh;
       nha = bpf_map_lookup_elem(&nh_map, &key);
       if (!nha) {
         /* No NH - PASS */
