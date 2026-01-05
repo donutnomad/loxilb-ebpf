@@ -606,7 +606,7 @@ struct pplat_map_d {
 struct xctk_d {
         __uint(type,        BPF_MAP_TYPE_PERCPU_ARRAY);
         __type(key,         __u32);
-        __type(value,       struct dp_ct_tact);
+        __type(value,       struct dp_ct_tact_scratch);
         __uint(max_entries, 2);
 } xctk SEC(".maps");
 

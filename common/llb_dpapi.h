@@ -712,6 +712,21 @@ struct dp_ct_tact {
   };
 };
 
+/* Scratch version without spinlock for PERCPU maps */
+struct dp_ct_tact_scratch {
+  struct dp_cmn_act ca;
+  __u32 pad_lock;       /* Padding to match dp_ct_tact layout (replaces bpf_spin_lock) */
+  struct dp_ct_dat ctd;
+  __u64 ito;
+  __u64 lts;
+  union {
+    struct dp_rdr_act port_act;
+    struct dp_sess_act pdr_sess_act;
+    struct dp_rt_nh_act rt_nh;
+    struct dp_nat_act nat_act;
+  };
+};
+
 struct dp_ct_tact_set {
   uint16_t wp;
   uint16_t fc;
