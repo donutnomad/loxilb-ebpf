@@ -428,7 +428,7 @@ struct tmac_stats_map_d {
 
 struct nh_map_d {
         __uint(type,        BPF_MAP_TYPE_ARRAY);
-        __type(key,         struct dp_nh_key);
+        __type(key,         __u32);
         __type(value,       struct dp_nh_tact);
         __uint(max_entries, LLB_NH_MAP_ENTRIES);
 } nh_map SEC(".maps");
