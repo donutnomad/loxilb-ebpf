@@ -1422,7 +1422,7 @@ dp_ct_est(struct xfi *xf,
 {
   struct dp_ct_dat *tdat = &atdat->ctd;
   //struct dp_ct_dat *xtdat = &axtdat->ctd;
-  struct dp_ct_tact *adat, *axdat;
+  struct dp_ct_tact_scratch *adat, *axdat;
   ct_sctp_pinf_t *ss;
   ct_sctp_pinf_t *tss;
   int i, j, k;
@@ -1630,8 +1630,8 @@ dp_ct_in(void *ctx, struct xfi *xf)
 {
   struct dp_ct_key key;
   struct dp_ct_key xkey;
-  struct dp_ct_tact *adat;
-  struct dp_ct_tact *axdat;
+  struct dp_ct_tact_scratch *adat;
+  struct dp_ct_tact_scratch *axdat;
   struct dp_ct_tact *atdat;
   struct dp_ct_tact *axtdat;
   nxfrm_inf_t *xi;
