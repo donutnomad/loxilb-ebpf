@@ -207,6 +207,10 @@ dp_ct_proto_xfk_init(struct dp_ct_key *key,
     if (key->l4proto != IPPROTO_ICMP)
       xxi->nat_xport = key->sport;
   }
+  /* Save original ports before any hairpin NAT modifications */
+  xi->osp = key->sport;
+  xi->odp = key->dport;
+
   if (xi->nat_flags & LLB_NAT_HDST) {
     DP_XADDR_CP(xkey->saddr, key->saddr);
     DP_XADDR_CP(xkey->daddr, key->daddr);
@@ -220,8 +224,11 @@ dp_ct_proto_xfk_init(struct dp_ct_key *key,
 
     xxi->nat_flags = LLB_NAT_HSRC;
     xxi->nv6 = key->v6;
-    DP_XADDR_SETZR(xxi->nat_xip);
-    DP_XADDR_SETZR(xi->nat_xip);
+    DP_XADDR_CP(xxi->nat_xip, key->daddr);
+    DP_XADDR_CP(xi->nat_xip, key->saddr);
+    /* Save original ports in reverse entry for de-NAT */
+    xxi->osp = key->dport;
+    xxi->odp = key->sport;
     if (key->l4proto != IPPROTO_ICMP)
       xxi->nat_xport = key->dport;
   }
@@ -238,8 +245,11 @@ dp_ct_proto_xfk_init(struct dp_ct_key *key,
 
     xxi->nat_flags = LLB_NAT_HDST;
     xxi->nv6 = key->v6;
-    DP_XADDR_SETZR(xxi->nat_xip);
-    DP_XADDR_SETZR(xi->nat_xip);
+    DP_XADDR_CP(xxi->nat_xip, key->saddr);
+    DP_XADDR_CP(xi->nat_xip, key->daddr);
+    /* Save original ports in reverse entry for de-NAT */
+    xxi->osp = key->sport;
+    xxi->odp = key->dport;
 
     if (key->l4proto != IPPROTO_ICMP)
       xxi->nat_xport = key->sport;
