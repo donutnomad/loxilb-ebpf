@@ -123,6 +123,9 @@ tc_packet_func__(struct __sk_buff *md)
   xf->pm.phit |= LLB_DP_FC_HIT;
   xf->pm.tc = 1;
 
+  /* Read skb->mark set by SO_MARK for proxy egress bypass */
+  xf->pm.dp_mark = md->mark;
+
   return dp_ingress_pkt_main(md, xf);
 }
 
@@ -153,6 +156,9 @@ int tc_packet_func_fast(struct __sk_buff *md)
   if (md->len > LLB_SKB_FIXUP_LEN) {
     bpf_skb_pull_data(md, LLB_SKB_MIN_DPA_LEN);
   }
+
+  /* Read skb->mark set by SO_MARK for proxy egress bypass */
+  xf->pm.dp_mark = md->mark;
 
   dp_parse_depth0(md, xf, 1);
 
