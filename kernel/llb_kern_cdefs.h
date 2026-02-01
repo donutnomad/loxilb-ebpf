@@ -1291,30 +1291,35 @@ dp_ins_ppv2(void *md, struct xfi *xf)
 
     tcp->check = csum_fold_helper_diff((__u32)csum);
   }
-  /* Handle UDP protocol */
+  /* Handle UDP protocol - Fixed for kernel 6.17+ verifier */
   else if (is_udp) {
-    dend = DP_TC_PTR(DP_PDATA_END(md));
-    udp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off + len);
-    if (udp + 1 > dend) {
+    struct udphdr udp_hdr;
+    __u32 udp_src_off = xf->pm.l4_off + len;
+    __u32 udp_dst_off = xf->pm.l4_off;
+
+    /* Load UDP header from source position using helper */
+    if (bpf_skb_load_bytes(md, udp_src_off, &udp_hdr, sizeof(udp_hdr)) < 0) {
       LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
       return -1;
     }
+
+    /* Save original values for checksum calculation */
+    __u16 old_check = udp_hdr.check;
 
     /* Update UDP length */
-    __u16 old_len = udp->len;
-    __u16 new_len = bpf_htons(bpf_ntohs(old_len) + len);
+    __u16 old_len_val = udp_hdr.len;
+    __u16 new_len_val = bpf_htons(bpf_ntohs(old_len_val) + len);
+    udp_hdr.len = new_len_val;
 
-    nudp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
-    if (nudp + 1 > dend) {
+    /* Store updated UDP header to destination position */
+    if (bpf_skb_store_bytes(md, udp_dst_off, &udp_hdr, sizeof(udp_hdr), 0) < 0) {
       LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
       return -1;
     }
 
-    __builtin_memmove(nudp, udp, sizeof(*udp));
-    nudp->len = new_len;
-
-    /* Insert PPv2 header right after UDP header */
-    ppv2h = (void *)(nudp + 1);
+    /* Get packet pointers for PPv2 header insertion */
+    dend = DP_TC_PTR(DP_PDATA_END(md));
+    ppv2h = DP_ADD_PTR(DP_PDATA(md), udp_dst_off + sizeof(struct udphdr));
     if ((void *)(ppv2h + 1) > dend) {
       LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
       return -1;
@@ -1323,20 +1328,22 @@ dp_ins_ppv2(void *md, struct xfi *xf)
     /* Checksum changes for UDP */
     olp = (__u32)bpf_htons(xf->pm.l3_plen);
     nlp = (__u32)bpf_htons(olp + len);
-    csum = bpf_csum_diff((__be32 *)&nlp, 4, (__be32 *)&olp, 4, udp->check);
+    csum = bpf_csum_diff((__be32 *)&nlp, 4, (__be32 *)&olp, 4, old_check);
 
     dp_populate_ppv2(md, xf, ppv2h, &csum);
 
-    dend = DP_TC_PTR(DP_PDATA_END(md));
-    nudp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
-    if (nudp + 1 > dend) {
-      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
-      return -1;
+    /* Update UDP checksum if needed */
+    if (old_check != 0) {
+      __u16 new_csum = csum_fold_helper_diff((__u32)csum);
+      __u32 csum_off = udp_dst_off + offsetof(struct udphdr, check);
+      if (bpf_skb_store_bytes(md, csum_off, &new_csum, sizeof(new_csum), 0) < 0) {
+        return -1;
+      }
     }
 
-    if (nudp->check != 0) {
-      nudp->check = csum_fold_helper_diff((__u32)csum);
-    }
+    /* Silence unused variable warnings - these are used elsewhere */
+    (void)udp;
+    (void)nudp;
   }
 
   return 0;
