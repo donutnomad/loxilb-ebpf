@@ -187,10 +187,21 @@ dp_do_nat(void *ctx, struct xfi *xf)
 
   act = bpf_map_lookup_elem(&nat_map, &key);
   if (!act) {
-    /* Default action - Nothing to do */
-    BPF_DBG_PRINTK("[NAT] lkup miss");
-    xf->pm.nf &= ~LLB_NAT_SRC;
-    return 0;
+    /* Try wildcard/default rule (0.0.0.0:0) */
+    struct dp_nat_key def_key = {0};
+    def_key.l4proto = key.l4proto;
+    def_key.zone = key.zone;
+    def_key.v6 = key.v6;
+    def_key.mark = key.mark;  /* Preserve mark for matching */
+
+    act = bpf_map_lookup_elem(&nat_map, &def_key);
+    if (!act) {
+      /* Default action - Nothing to do */
+      BPF_DBG_PRINTK("[NAT] lkup miss (no default rule)");
+      xf->pm.nf &= ~LLB_NAT_SRC;
+      return 0;
+    }
+    BPF_DBG_PRINTK("[NAT] using default rule");
   }
 
   xf->pm.phit |= LLB_DP_NAT_HIT;
@@ -200,8 +211,9 @@ dp_do_nat(void *ctx, struct xfi *xf)
   if (act->opflags & NAT_LB_OP_CHKSRC) {
     __u32 bm = (1 << act->ca.cidx) & 0xffffff;
     if (!(xf->pm.dp_mark & bm)) {
-      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_UNK);
-      return 1;
+      /* Pass through unmatched traffic instead of dropping */
+      xf->pm.nf &= ~LLB_NAT_SRC;
+      return 0;
     }
   }
 
